@@ -1,0 +1,6 @@
+.env
+ebay_state.json
+reminders.json
+venv/
+__pycache__/
+.claude/settings.local.json
