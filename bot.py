@@ -35,6 +35,9 @@ EBAY_RATE_LIMIT_MESSAGE = "⚠️ eBay API rate limit reached — skipping this 
 EBAY_CUSTOMER_REMINDER_DELAY = timedelta(hours=24)
 
 ebay_rate_limited = False
+# Populated once in on_ready() via application_info() - doesn't need the
+# privileged GUILD_MEMBERS intent, unlike guild.members/guild.fetch_members().
+bot_owner_id = None
 
 
 class EbayRateLimitError(Exception):
@@ -185,6 +188,11 @@ def load_ebay_state():
     state.setdefault("seen_conversation_message_ids", {})
     state.setdefault("customer_conversations", {})
     state.setdefault("customer_last_notified_message_ids", {})
+    # Survives customer_conversations entries being cleared (seller-reply
+    # resolution, "Mark as Finished") so a conversation that goes quiet and
+    # then gets a new buyer message can reopen its existing thread instead of
+    # creating a duplicate one and re-backfilling the whole history.
+    state.setdefault("customer_conversation_thread_ids", {})
     return state
 
 
@@ -231,6 +239,37 @@ def fetch_ebay_conversations(access_token):
         raise EbayRateLimitError("eBay conversation API rate limit reached")
     response.raise_for_status()
     return response.json().get("conversations", [])
+
+
+def fetch_ebay_conversation_history(access_token, convo_id):
+    """Full message history for one conversation, oldest-first.
+
+    eBay's singular getConversation endpoint returns messages newest-first
+    and paginates via limit/offset/total - confirmed empirically against the
+    live API (docs site was unreachable), not documented anywhere obvious.
+    """
+    messages = []
+    offset = 0
+    limit = 25
+    while True:
+        response = requests.get(
+            f"{EBAY_CONVERSATION_URL}/{convo_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"conversation_type": "FROM_MEMBERS", "offset": offset, "limit": limit},
+        )
+        if is_ebay_rate_limit_response(response):
+            raise EbayRateLimitError("eBay conversation history API rate limit reached")
+        response.raise_for_status()
+        data = response.json()
+        batch = data.get("messages", [])
+        messages.extend(batch)
+        total = data.get("total", len(messages))
+        offset += len(batch)
+        if not batch or offset >= total:
+            break
+
+    messages.reverse()
+    return messages
 
 
 async def notify_ebay_rate_limit(channel):
@@ -301,15 +340,17 @@ class FinishConversationButton(
         await interaction.followup.send("Marked this conversation as finished.", ephemeral=True)
 
 
-def build_customer_message_embed(buyer, message_body):
+def build_root_conversation_embed(buyer):
     lines = []
     if EBAY_SELLER_USERNAME:
-        lines.append(f"**{EBAY_SELLER_USERNAME}**")
-
-    lines.append(f"💬 New customer message from {buyer}:")
-    lines.append(f'"{message_body}"')
+        lines.append(f"eBay ID: {EBAY_SELLER_USERNAME}")
+    lines.append(f"💬 Conversation with user {buyer}:")
 
     return discord.Embed(description="\n".join(lines), color=discord.Color.blurple())
+
+
+def format_thread_message(sender, message_body):
+    return f"**{sender}:** {message_body}"
 
 
 def build_customer_reminder_text(buyer, message_body):
@@ -331,31 +372,203 @@ def build_customer_message_view(convo_id, message_link):
     return view
 
 
-async def send_new_customer_notification(customer_channel, state, convo_id, buyer, message_body, message_link, ebay_message_id, now):
-    embed = build_customer_message_embed(buyer, message_body)
-    view = build_customer_message_view(convo_id, message_link)
+async def get_conversation_thread(customer_channel, thread_id):
+    if not thread_id:
+        return None
+    thread = client.get_channel(thread_id)
+    if thread is not None:
+        return thread
     try:
-        sent_message = await customer_channel.send(embed=embed, view=view)
+        return await customer_channel.guild.fetch_channel(thread_id)
+    except discord.HTTPException:
+        return None
+
+
+async def add_owner_to_thread(thread, convo_id):
+    # @everyone inside a thread only reaches members already in that thread's
+    # membership list - it doesn't add anyone (confirmed empirically, see
+    # claude.md). Explicitly adding the owner here is what makes @everyone
+    # actually work for later thread activity (24h escalations, etc).
+    # guild.members/guild.fetch_members() need the privileged GUILD_MEMBERS
+    # intent (not enabled for this app); add_user() with a known id doesn't.
+    if bot_owner_id is None:
+        return
+    try:
+        await thread.add_user(discord.Object(id=bot_owner_id))
     except discord.HTTPException as e:
-        print(f"Failed to notify about customer conversation {convo_id}: {e}")
+        print(f"Could not add owner to thread for customer conversation {convo_id}: {e}")
+
+
+async def get_or_create_conversation_thread(customer_channel, state, convo_id, entry):
+    thread = await get_conversation_thread(customer_channel, entry.get("thread_id"))
+    if thread is not None:
+        return thread
+
+    # Legacy conversations tracked before the per-conversation-thread redesign
+    # have no thread_id - derive/create one from the root notification message
+    # and persist it so future lookups take the fast path above.
+    notification_message_id = entry.get("message_id")
+    if not notification_message_id:
+        return None
+    try:
+        original_message = await customer_channel.fetch_message(notification_message_id)
+        thread = original_message.thread
+        if thread is None:
+            thread_name = truncate_thread_name(f"eBay: {entry.get('buyer_username', 'buyer')}")
+            thread = await original_message.create_thread(name=thread_name)
+            await add_owner_to_thread(thread, convo_id)
+    except discord.HTTPException as e:
+        print(f"Could not open/create thread for customer conversation {convo_id}: {e}")
+        return None
+
+    entry["thread_id"] = thread.id
+    state["customer_conversation_thread_ids"][convo_id] = thread.id
+    save_ebay_state(state)
+    return thread
+
+
+async def create_new_conversation_thread(
+    customer_channel, state, access_token, convo_id, buyer, message_link,
+    fallback_message_id, fallback_message_body, now,
+):
+    embed = build_root_conversation_embed(buyer)
+    view = build_customer_message_view(convo_id, message_link)
+    # Mentions only trigger a real Discord notification when they're in the
+    # message content (or a component) - a mention inside an embed never pings.
+    # No allowed_mentions is set anywhere (client or per-call), so this payload
+    # omits that field entirely and Discord's own default applies, which lets
+    # @everyone through (subject to the bot's "Mention @everyone" permission) -
+    # confirmed against discord.py's http.handle_message_parameters source.
+    try:
+        root_message = await customer_channel.send(content="@everyone", embed=embed, view=view)
+    except discord.HTTPException as e:
+        print(f"Failed to post root notification for customer conversation {convo_id}: {e}")
+        return False
+
+    thread_name = truncate_thread_name(f"eBay: {buyer}")
+    try:
+        thread = await root_message.create_thread(name=thread_name)
+        await add_owner_to_thread(thread, convo_id)
+    except discord.HTTPException as e:
+        print(f"Failed to create thread for customer conversation {convo_id}: {e}")
+        thread = None
+
+    try:
+        history = fetch_ebay_conversation_history(access_token, convo_id)
+    except (EbayRateLimitError, requests.RequestException) as e:
+        print(f"Failed to fetch message history for customer conversation {convo_id}: {e}")
+        history = []
+
+    if not history and fallback_message_id:
+        # getConversation failed - fall back to just the single message that
+        # triggered this notification so the thread isn't left empty.
+        history = [{
+            "messageId": fallback_message_id,
+            "messageBody": fallback_message_body,
+            "senderUsername": buyer,
+        }]
+
+    posted_ids = []
+    if thread is not None:
+        for msg in history:
+            body = truncate_for_discord(msg.get("messageBody", ""))
+            sender = msg.get("senderUsername", "unknown")
+            try:
+                await thread.send(format_thread_message(sender, body))
+            except discord.HTTPException as e:
+                print(f"Failed to post history message into thread for customer conversation {convo_id}: {e}")
+                continue
+            msg_id = msg.get("messageId")
+            if msg_id:
+                posted_ids.append(msg_id)
+
+    last_message_id = history[-1]["messageId"] if history else fallback_message_id
+
+    state["customer_conversations"][convo_id] = {
+        "first_seen_utc": now.isoformat(),
+        "reminded": False,
+        "buyer_username": buyer,
+        "message_id": root_message.id,
+        "thread_id": thread.id if thread is not None else None,
+        "last_ebay_message_id": last_message_id,
+        "posted_message_ids": posted_ids,
+    }
+    if thread is not None:
+        state["customer_conversation_thread_ids"][convo_id] = thread.id
+    # Persists independently of customer_conversations so that clicking "Mark
+    # Conversation as Finished" (which clears the entry above) can't cause the
+    # same still-unreplied eBay message to be re-announced on the next poll.
+    state["customer_last_notified_message_ids"][convo_id] = last_message_id
+    save_ebay_state(state)
+    return True
+
+
+async def post_new_thread_message(customer_channel, state, convo_id, entry, sender, message_body, message_id, now):
+    thread = await get_or_create_conversation_thread(customer_channel, state, convo_id, entry)
+    destination = thread if thread is not None else customer_channel
+
+    try:
+        await destination.send(format_thread_message(sender, message_body))
+    except discord.HTTPException as e:
+        print(f"Failed to post new message for customer conversation {convo_id}: {e}")
+        return False
+
+    # New message restarts the 24h reminder clock.
+    entry["first_seen_utc"] = now.isoformat()
+    entry["reminded"] = False
+    entry["last_ebay_message_id"] = message_id
+    # Deliberately indexes rather than setdefault()s: the caller is expected to
+    # have already seeded this for legacy entries, so a missing key here should
+    # fail loudly instead of silently masking a re-introduced backfill gap.
+    posted_ids = entry["posted_message_ids"]
+    if message_id not in posted_ids:
+        posted_ids.append(message_id)
+    state["customer_last_notified_message_ids"][convo_id] = message_id
+    save_ebay_state(state)
+    return True
+
+
+async def reopen_conversation_thread(customer_channel, state, convo_id, thread_id, buyer, message_body, message_id, now):
+    # Conversation went quiet (seller replied, or "Mark as Finished") and its
+    # customer_conversations entry was cleared, but the buyer just wrote again.
+    # Reuse the existing thread instead of creating a new one and re-backfilling
+    # the whole history from scratch - the whole point of customer_conversation_thread_ids.
+    #
+    # Returns True (reopened), False (thread genuinely gone/broken - safe for
+    # the caller to create a fresh one), or None (transient failure - caller
+    # should skip this poll and retry later, NOT fall back to creating a
+    # duplicate thread just because of a momentary rate limit or 5xx).
+    thread = client.get_channel(thread_id)
+    if thread is None:
+        try:
+            thread = await customer_channel.guild.fetch_channel(thread_id)
+        except discord.NotFound:
+            return False
+        except discord.HTTPException as e:
+            print(f"Transient error resolving thread for customer conversation {convo_id}, will retry next poll: {e}")
+            return None
+
+    try:
+        await thread.send(format_thread_message(buyer, message_body))
+    except discord.HTTPException as e:
+        print(f"Failed to post reopened message for customer conversation {convo_id}: {e}")
         return False
 
     state["customer_conversations"][convo_id] = {
         "first_seen_utc": now.isoformat(),
         "reminded": False,
         "buyer_username": buyer,
-        "message_id": sent_message.id,
-        "last_ebay_message_id": ebay_message_id,
+        "message_id": thread.id,  # thread shares its id with the message that started it
+        "thread_id": thread.id,
+        "last_ebay_message_id": message_id,
+        "posted_message_ids": [message_id] if message_id else [],
     }
-    # Persists independently of customer_conversations so that clicking "Mark
-    # Conversation as Finished" (which clears the entry above) can't cause the
-    # same still-unreplied eBay message to be re-announced on the next poll.
-    state["customer_last_notified_message_ids"][convo_id] = ebay_message_id
+    state["customer_last_notified_message_ids"][convo_id] = message_id
     save_ebay_state(state)
     return True
 
 
-async def process_customer_conversations(customer_channel, conversations, state):
+async def process_customer_conversations(customer_channel, conversations, state, access_token):
     now = datetime.now(timezone.utc)
 
     for convo in conversations:
@@ -385,11 +598,18 @@ async def process_customer_conversations(customer_channel, conversations, state)
                 save_ebay_state(state)
                 continue
 
-            if message_id and message_id != entry.get("last_ebay_message_id"):
+            if "posted_message_ids" not in entry:
+                # Legacy entry from before this field existed - seed it from
+                # last_ebay_message_id so its already-announced message isn't
+                # mistaken for new and reposted (see claude.md backfill gotcha).
+                seed_id = entry.get("last_ebay_message_id")
+                entry["posted_message_ids"] = [seed_id] if seed_id else []
+            posted_ids = entry["posted_message_ids"]
+            if message_id and message_id not in posted_ids:
                 # Same buyer, but a new message arrived on this still-open conversation -
-                # notify again and restart the 24h reminder clock from this message.
-                await send_new_customer_notification(
-                    customer_channel, state, convo_id, sender, message_body, message_link, message_id, now
+                # post it into the existing thread and restart the 24h reminder clock.
+                await post_new_thread_message(
+                    customer_channel, state, convo_id, entry, sender, message_body, message_id, now
                 )
                 continue
 
@@ -399,23 +619,19 @@ async def process_customer_conversations(customer_channel, conversations, state)
             first_seen = datetime.fromisoformat(entry["first_seen_utc"])
             if now - first_seen >= EBAY_CUSTOMER_REMINDER_DELAY:
                 reminder_text = build_customer_reminder_text(sender, message_body)
+                # NOTE: unlike the root notification, this sends inside the
+                # conversation's THREAD - @everyone in a thread only notifies
+                # members already in that thread's membership list, and (unlike
+                # an individual <@user_id> mention) does not add anyone to it.
+                # This is why add_owner_to_thread() explicitly adds the owner as
+                # a real thread member at creation time (both in
+                # create_new_conversation_thread and the legacy self-heal path
+                # below) - without that, this @everyone would only reach whoever
+                # already happened to be in the thread. See claude.md gotchas.
+                reminder_text = f"@everyone {reminder_text}"
 
-                destination = customer_channel
-                notification_message_id = entry.get("message_id")
-                if notification_message_id:
-                    try:
-                        original_message = await customer_channel.fetch_message(notification_message_id)
-                        thread = original_message.thread
-                        if thread is None:
-                            thread_name = truncate_thread_name(f"Unreplied: {sender}")
-                            thread = await original_message.create_thread(name=thread_name)
-                        destination = thread
-                    except discord.HTTPException as e:
-                        print(
-                            f"Could not open/create reminder thread for customer conversation "
-                            f"{convo_id}, falling back to channel: {e}"
-                        )
-                        destination = customer_channel
+                thread = await get_or_create_conversation_thread(customer_channel, state, convo_id, entry)
+                destination = thread if thread is not None else customer_channel
 
                 try:
                     await destination.send(reminder_text)
@@ -436,9 +652,22 @@ async def process_customer_conversations(customer_channel, conversations, state)
                 continue
 
             buyer = sender
-            await send_new_customer_notification(
-                customer_channel, state, convo_id, buyer, message_body, message_link, message_id, now
-            )
+            existing_thread_id = state["customer_conversation_thread_ids"].get(convo_id)
+            reopened = False
+            if existing_thread_id:
+                reopened = await reopen_conversation_thread(
+                    customer_channel, state, convo_id, existing_thread_id, buyer, message_body, message_id, now
+                )
+            if reopened is False:
+                # No known thread for this conversation, or it's genuinely
+                # gone/broken - fall back to creating fresh. Deliberately does
+                # NOT fall back when reopened is None (a transient error, e.g.
+                # rate limit) - that should just retry next poll, not create a
+                # duplicate thread over what might still be a perfectly good one.
+                await create_new_conversation_thread(
+                    customer_channel, state, access_token, convo_id, buyer, message_link,
+                    message_id, message_body, now,
+                )
 
 
 @tasks.loop(minutes=2)
@@ -537,13 +766,21 @@ async def check_ebay_activity():
         save_ebay_state(state)
 
     if customer_channel is not None:
-        await process_customer_conversations(customer_channel, conversations, state)
+        await process_customer_conversations(customer_channel, conversations, state, access_token)
 
     ebay_rate_limited = False
 
 
 @client.event
 async def on_ready():
+    global bot_owner_id
+    if bot_owner_id is None:
+        try:
+            app_info = await client.application_info()
+            bot_owner_id = app_info.owner.id
+        except discord.HTTPException as e:
+            print(f"Could not fetch application owner for thread auto-add: {e}")
+
     await tree.sync()
     if not check_reminders.is_running():
         check_reminders.start()
