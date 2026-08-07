@@ -23,7 +23,11 @@ it runs 24/7. Neither requires writing code — just following steps.
    "Message Content Intent" — this bot only uses slash commands.
 6. In the left sidebar, click **OAuth2** → **URL Generator**.
    - Under **Scopes**, check `bot` and `applications.commands`.
-   - Under **Bot Permissions**, check `Send Messages`, `Read Message History`, and `Use Slash Commands`.
+   - Under **Bot Permissions**, check `Send Messages`, `Read Message History`, `Use Slash Commands`,
+     `Mention @everyone, @here, and All Roles` (needed for the eBay customer-message channel's
+     @everyone pings to actually notify anyone, not just render as plain text), and `Manage Threads`
+     (needed to properly delete threads — without it, deleting the root message leaves the thread
+     itself orphaned and still visible).
    - Copy the generated URL at the bottom, paste it into your browser, choose your
      server, and click **Authorize**. Your bot now appears in the server (offline until
      Part 2 is done).
