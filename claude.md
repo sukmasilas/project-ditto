@@ -103,3 +103,31 @@ Requests from the owner often arrive as loose, informal descriptions, not fully-
 4. Before declaring the task done, hand off to the `qa-reviewer` subagent (if configured) to check correctness, then report back in plain terms.
 
 This applies even mid-task — if new instructions arrive that change scope, re-scope out loud before continuing rather than silently absorbing the change.
+
+## Deploy access — scoped, not root (as of 2026-09-30)
+
+Per Dotworks' "Infra task: per-project scoped deploy access" (see the sibling
+`dotworks-main` project's `CLAUDE.md`), this bot now runs under its own
+non-root `ditto` Linux user on the shared droplet, its own `pm2` daemon
+(`pm2-ditto.service`), and its own SSH key — not the old shared root
+key/pm2 daemon it ran under until this migration (the app directory also
+moved from `/root/project-ditto` to `/opt/apps/ditto` as part of this).
+Routine deploy:
+```
+ssh -i ~/.ssh/id_ed25519_ditto_deploy ditto@<droplet-ip>
+cd /opt/apps/ditto
+git pull
+pm2 restart ditto
+```
+Note the pm2 process name changed from `project-ditto` to `ditto` as part of
+this migration — scripts or muscle-memory referencing the old name will not
+find the process anymore. The `ditto` user has no sudo and cannot see or
+touch Dotworks', Noctrowl's, or Alakazam's files or processes — that
+boundary is enforced by Linux, not convention. The shared root key is
+retained only for genuinely cross-cutting work (nginx, Postgres roles, OS
+packages) and belongs to whoever is acting as infra coordinator, not to
+routine deploys of this bot. Full history/rationale of the migration
+(including a real bug caught live: the old process was registered as
+`project-ditto`, causing a brief duplicate-instance situation until the
+name mismatch was found and fixed) lives in `dotworks-main/CLAUDE.md`, not
+duplicated here.
