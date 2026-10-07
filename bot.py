@@ -11,6 +11,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 from ebay_auth import get_access_token
+import ebay_trading
 
 load_dotenv()
 
@@ -66,6 +67,25 @@ def get_customer_account():
     # identity) will need to change to disambiguate which account a click
     # belongs to.
     return next((a for a in EBAY_ACCOUNTS if a["customer_channel_id"]), None)
+
+
+# Classic Trading API (XML) fallback path, ricky.garage-specific - see
+# ebay_trading.py's module docstring and claude.md for the full story and
+# the two hard safety guardrails around this credential set. This is
+# DELIBERATELY separate from EBAY_APP_ID/EBAY_CERT_ID (the REST credential
+# set) - a different, shared credential that Lister Tool also depends on.
+EBAY_TRADING_CLIENT_ID = os.environ.get("EBAY_TRADING_CLIENT_ID")
+EBAY_TRADING_CLIENT_SECRET = os.environ.get("EBAY_TRADING_CLIENT_SECRET")
+EBAY_TRADING_REFRESH_TOKEN = os.environ.get("EBAY_TRADING_REFRESH_TOKEN")
+EBAY_TRADING_ACCOUNT_NAME = os.environ.get("EBAY_TRADING_ACCOUNT_NAME")
+EBAY_TRADING_ENABLED = bool(
+    EBAY_TRADING_CLIENT_ID and EBAY_TRADING_CLIENT_SECRET
+    and EBAY_TRADING_REFRESH_TOKEN and EBAY_TRADING_ACCOUNT_NAME
+)
+# Reuses the matching EBAY_ACCOUNT_N_ALERT_CHANNEL_ID rather than a separate
+# channel env var, since this posts into the same channel as that account's
+# REST-based general feed - one channel ID to keep in sync, not two.
+EBAY_TRADING_STATE_KEY = f"{EBAY_TRADING_ACCOUNT_NAME}_trading" if EBAY_TRADING_ACCOUNT_NAME else None
 
 
 EBAY_ORDER_URL = "https://api.ebay.com/sell/fulfillment/v1/order"
@@ -250,6 +270,15 @@ def load_ebay_state():
         # and then gets a new buyer message can reopen its existing thread
         # instead of creating a duplicate one and re-backfilling the history.
         account_state.setdefault("customer_conversation_thread_ids", {})
+
+    if EBAY_TRADING_ENABLED:
+        # Deliberately its own namespace, not merged into the REST-based
+        # account_state above - different API, different ID space (eBay
+        # Trading API OrderID/MessageID vs the REST orderId/messageId), kept
+        # separate so the two dedup mechanisms can't be confused.
+        trading_state = state.setdefault(EBAY_TRADING_STATE_KEY, {})
+        trading_state.setdefault("seen_order_ids", [])
+        trading_state.setdefault("seen_message_ids", [])
 
     return state
 
@@ -849,6 +878,108 @@ async def check_ebay_activity():
     ebay_rate_limited = False
 
 
+@tasks.loop(minutes=2)
+async def check_ebay_trading_activity():
+    # Classic Trading API fallback, ricky.garage-specific. Deliberately its
+    # own background loop, isolated from check_ebay_activity() above - a
+    # different credential (shared with Lister Tool), a different protocol,
+    # and a higher blast radius if anything ever went wrong here. See
+    # ebay_trading.py's module docstring and claude.md before touching this.
+    if not EBAY_TRADING_ENABLED:
+        return
+
+    account = next((a for a in EBAY_ACCOUNTS if a["name"] == EBAY_TRADING_ACCOUNT_NAME), None)
+    if account is None:
+        print(
+            f"eBay Trading API fallback: no active EBAY_ACCOUNT entry named "
+            f"{EBAY_TRADING_ACCOUNT_NAME!r} (EBAY_TRADING_ACCOUNT_NAME) - skipping this cycle."
+        )
+        return
+
+    channel = client.get_channel(account["alert_channel_id"])
+    if channel is None:
+        print(f"eBay Trading API alert channel {account['alert_channel_id']} not found.")
+        return
+
+    state = load_ebay_state()
+    trading_state = state[EBAY_TRADING_STATE_KEY]
+    now = datetime.now(timezone.utc)
+    # 2-minute poll interval + a 5-minute overlap buffer, so a slow-to-settle
+    # order can't fall between two polls and get missed entirely. The
+    # overlap's duplicates are filtered out by the seen_order_ids diff below.
+    window_start = now - timedelta(minutes=7)
+
+    try:
+        orders = ebay_trading.fetch_trading_orders(
+            EBAY_TRADING_CLIENT_ID, EBAY_TRADING_CLIENT_SECRET, EBAY_TRADING_REFRESH_TOKEN,
+            window_start, now,
+        )
+    except (ebay_trading.TradingApiError, requests.RequestException) as e:
+        print(f"eBay Trading API GetOrders failed: {e}")
+        orders = []
+
+    for order in orders:
+        order_id = order.get("order_id")
+        if not order_id or order_id in trading_state["seen_order_ids"]:
+            continue
+
+        try:
+            title = order.get("title") or order_id
+            buyer = order.get("buyer")
+            price = f"{order.get('total') or '?'} {order.get('currency') or ''}".strip()
+            await channel.send(f"🛒 New order (ricky.garage): {title} — {buyer}, {price}.")
+        except discord.HTTPException as e:
+            print(f"Failed to notify about Trading API order {order_id}: {e}")
+            continue
+
+        trading_state["seen_order_ids"].append(order_id)
+        save_ebay_state(state)
+
+    try:
+        messages = ebay_trading.fetch_trading_messages(
+            EBAY_TRADING_CLIENT_ID, EBAY_TRADING_CLIENT_SECRET, EBAY_TRADING_REFRESH_TOKEN,
+        )
+    except (ebay_trading.TradingApiError, requests.RequestException) as e:
+        print(f"eBay Trading API GetMemberMessages/GetMyMessages failed: {e}")
+        messages = []
+
+    for msg in messages:
+        message_id = msg.get("message_id")
+        if not message_id or message_id in trading_state["seen_message_ids"]:
+            continue
+
+        if msg.get("replied"):
+            # Genuinely already answered per GetMyMessages' per-message
+            # Replied flag - NOT eBay's thread-batched MessageStatus, which
+            # is confirmed unreliable (see ebay_trading.py, claude.md).
+            # Nothing to alert on; record it so it's never re-evaluated.
+            trading_state["seen_message_ids"].append(message_id)
+            save_ebay_state(state)
+            continue
+
+        try:
+            sender = msg.get("sender")
+            preview = truncate_for_discord(msg.get("body") or "", limit=300)
+            await channel.send(f'💬 New unanswered message (ricky.garage) from {sender}: "{preview}"')
+        except discord.HTTPException as e:
+            print(f"Failed to notify about Trading API message {message_id}: {e}")
+            continue
+
+        trading_state["seen_message_ids"].append(message_id)
+        save_ebay_state(state)
+
+
+@check_ebay_trading_activity.error
+async def check_ebay_trading_activity_error(error):
+    # discord.ext.tasks stops the loop on any unhandled exception rather than
+    # silently retrying - correct behavior here, especially for a
+    # TradingApiGuardrailError, which should halt everything until a human
+    # looks at it, not keep looping as if nothing happened.
+    print(f"eBay Trading API background loop stopped due to an error: {error!r}")
+    if isinstance(error, ebay_trading.TradingApiGuardrailError):
+        print("GUARDRAIL TRIP in ebay_trading.py - this must never happen. Investigate before restarting.")
+
+
 @client.event
 async def on_ready():
     await tree.sync()
@@ -866,6 +997,10 @@ async def on_ready():
                 f"EBAY_ACCOUNT_..._SELLER_USERNAME not set for account {account['name']}: customer-message "
                 "tracking can't tell the seller's own replies apart from new customer messages."
             )
+    if EBAY_TRADING_ENABLED and not check_ebay_trading_activity.is_running():
+        check_ebay_trading_activity.start()
+    elif not EBAY_TRADING_ENABLED:
+        print("eBay Trading API fallback not started: EBAY_TRADING_CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN/ACCOUNT_NAME not fully set.")
     print(f"Logged in as {client.user} — reminder bot is ready.")
 
 

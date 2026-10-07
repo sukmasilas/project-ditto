@@ -98,6 +98,25 @@ on every other account.
 `EBAY_APP_ID` / `EBAY_CERT_ID` / `EBAY_RUNAME` stay as single, shared values — they identify
 the eBay *application* these accounts authorize through, not a specific seller account.
 
+### Classic Trading API fallback (for one account whose REST token can't authenticate)
+
+If an account's `EBAY_ACCOUNT_N_REFRESH_TOKEN` can't be granted the modern REST scopes it needs
+(this happened with `ricky.garage` — see `claude.md`), there's a separate fallback path using
+eBay's older Trading API (XML) instead, via a **different, separate credential set**:
+
+- `EBAY_TRADING_CLIENT_ID`, `EBAY_TRADING_CLIENT_SECRET`, `EBAY_TRADING_REFRESH_TOKEN` — do
+  **not** reuse `EBAY_APP_ID`/`EBAY_CERT_ID` here, this is intentionally a different credential.
+- `EBAY_TRADING_ACCOUNT_NAME` — must match one of the `EBAY_ACCOUNT_N_NAME` values above; that
+  account's `ALERT_CHANNEL_ID` is reused for these notifications, no separate channel needed.
+
+⚠️ **If this credential set is shared with another app on your server (as it is here, with
+Lister Tool), never regenerate `EBAY_TRADING_REFRESH_TOKEN` via a fresh authorization/consent
+flow** — that invalidates the existing token and breaks the other app's production access too.
+See `claude.md`'s gotcha on this before touching it.
+
+All four `EBAY_TRADING_*` vars must be set together for this fallback to activate — it's off
+by default and only needed for accounts where the normal REST path doesn't work.
+
 ---
 
 ## How to use it in Discord

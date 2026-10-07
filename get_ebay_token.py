@@ -1,5 +1,5 @@
 import sys
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import requests
 
@@ -19,6 +19,10 @@ def print_consent_url():
 
 
 def exchange_code_for_token(code):
+    # The code copied from the browser's address bar is still URL-encoded
+    # (eBay codes contain ^ and # as %5E/%23). Decode it here so it isn't
+    # encoded a second time when building the token request body.
+    code = unquote(code)
     try:
         tokens = exchange_code_for_tokens(code)
     except requests.HTTPError as e:
