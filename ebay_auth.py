@@ -12,6 +12,8 @@ RUNAME = os.environ["EBAY_RUNAME"]
 
 AUTH_URL = "https://auth.ebay.com/oauth2/authorize"
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+# (connect, read) seconds - requests has no default timeout.
+HTTP_TIMEOUT = (10, 30)
 SCOPE = (
     "https://api.ebay.com/oauth/api_scope/commerce.message "
     "https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly"
@@ -31,6 +33,7 @@ def _post_token_request(data):
             "Content-Type": "application/x-www-form-urlencoded",
         },
         data=data,
+        timeout=HTTP_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()

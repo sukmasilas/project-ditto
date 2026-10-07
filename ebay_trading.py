@@ -35,6 +35,12 @@ import requests
 TRADING_API_URL = "https://api.ebay.com/ws/api.dll"
 TRADING_TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 
+# (connect, read) seconds. requests has NO default timeout, so without this a
+# single hung eBay call would wait forever. The bot runs these calls off the
+# event loop (asyncio.to_thread in bot.py), so a slow call no longer freezes
+# Discord's heartbeat - this just bounds how long one poll can take.
+HTTP_TIMEOUT = (10, 30)
+
 # Confirmed empirically against Lister Tool's own working production request
 # headers on this server (same shared credential, read-only inspection, not
 # guessed) - not from docs, since developer.ebay.com was unreachable for this
@@ -96,6 +102,7 @@ def get_trading_access_token(client_id, client_secret, refresh_token, force_refr
             "Content-Type": "application/x-www-form-urlencoded",
         },
         data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        timeout=HTTP_TIMEOUT,
     )
     response.raise_for_status()
     data = response.json()
@@ -158,7 +165,7 @@ def _call_trading_api(call_name, xml_body, access_token):
         "X-EBAY-API-IAF-TOKEN": access_token,
         "Content-Type": "text/xml",
     }
-    response = requests.post(TRADING_API_URL, headers=headers, data=xml_body.encode("utf-8"))
+    response = requests.post(TRADING_API_URL, headers=headers, data=xml_body.encode("utf-8"), timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     return _strip_namespace(ET.fromstring(response.content))
 

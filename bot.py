@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 from datetime import datetime, timedelta, timezone
@@ -86,6 +87,11 @@ EBAY_TRADING_ENABLED = bool(
 # channel env var, since this posts into the same channel as that account's
 # REST-based general feed - one channel ID to keep in sync, not two.
 EBAY_TRADING_STATE_KEY = f"{EBAY_TRADING_ACCOUNT_NAME}_trading" if EBAY_TRADING_ACCOUNT_NAME else None
+# How often the Trading API fallback polls. Defaults to 10 minutes (was a
+# hardcoded 2): every poll is 3+ Trading API calls on the app shared with
+# Lister Tool, and eBay was returning error 518 ("exceeded usage limit on
+# this call") at the 2-minute rate.
+EBAY_TRADING_POLL_MINUTES = max(1, int(os.environ.get("EBAY_TRADING_POLL_MINUTES") or "10"))
 
 
 EBAY_ORDER_URL = "https://api.ebay.com/sell/fulfillment/v1/order"
@@ -93,6 +99,19 @@ EBAY_CONVERSATION_URL = "https://api.ebay.com/commerce/message/v1/conversation"
 EBAY_STATE_FILE = "ebay_state.json"
 EBAY_RATE_LIMIT_MESSAGE = "⚠️ eBay API rate limit reached — skipping this check, will retry next cycle"
 EBAY_CUSTOMER_REMINDER_DELAY = timedelta(hours=24)
+# (connect, read) seconds - requests has no default timeout.
+EBAY_HTTP_TIMEOUT = (10, 30)
+
+# Every eBay HTTP call runs via asyncio.to_thread so a slow eBay response
+# can't block the event loop (it used to, which starved discord.py's gateway
+# heartbeat and made Discord drop the connection - hundreds of "heartbeat
+# blocked" warnings a week). The catch: with the loop no longer frozen, the
+# two eBay polling loops and the Finish button can now genuinely interleave,
+# and each one loads, modifies and rewrites the WHOLE ebay_state.json - so
+# one could save a stale copy over another's changes (lost seen-IDs ->
+# duplicate notifications). Everything that load/modify/saves that file
+# holds this lock for the whole read-modify-write.
+ebay_state_lock = asyncio.Lock()
 
 # Deliberately a single shared flag, not per-account: eBay's call limits are
 # scoped per APPLICATION by default (shared across every token/user of that
@@ -309,6 +328,7 @@ def fetch_ebay_orders(access_token):
     response = requests.get(
         EBAY_ORDER_URL,
         headers={"Authorization": f"Bearer {access_token}"},
+        timeout=EBAY_HTTP_TIMEOUT,
         params={"limit": 50},
     )
     if is_ebay_rate_limit_response(response):
@@ -321,6 +341,7 @@ def fetch_ebay_conversations(access_token):
     response = requests.get(
         EBAY_CONVERSATION_URL,
         headers={"Authorization": f"Bearer {access_token}"},
+        timeout=EBAY_HTTP_TIMEOUT,
     )
     if is_ebay_rate_limit_response(response):
         raise EbayRateLimitError("eBay conversation API rate limit reached")
@@ -342,6 +363,7 @@ def fetch_ebay_conversation_history(access_token, convo_id):
         response = requests.get(
             f"{EBAY_CONVERSATION_URL}/{convo_id}",
             headers={"Authorization": f"Bearer {access_token}"},
+            timeout=EBAY_HTTP_TIMEOUT,
             params={"conversation_type": "FROM_MEMBERS", "offset": offset, "limit": limit},
         )
         if is_ebay_rate_limit_response(response):
@@ -400,12 +422,6 @@ class FinishConversationButton(
         return cls(match["convo_id"])
 
     async def callback(self, interaction: discord.Interaction):
-        state = load_ebay_state()
-        account = get_customer_account()
-        if account is not None:
-            state[account["name"]]["customer_conversations"].pop(self.convo_id, None)
-            save_ebay_state(state)
-
         embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
         embed.description = f"{embed.description or ''}\n\n✅ Marked as finished by {interaction.user.mention}"
 
@@ -425,7 +441,18 @@ class FinishConversationButton(
             )
         )
 
+        # Respond before touching state: Discord requires an interaction
+        # response within 3s, and a poll may be holding ebay_state_lock for
+        # longer than that while it waits on eBay.
         await interaction.response.edit_message(embed=embed, view=disabled_view)
+
+        async with ebay_state_lock:
+            state = load_ebay_state()
+            account = get_customer_account()
+            if account is not None:
+                state[account["name"]]["customer_conversations"].pop(self.convo_id, None)
+                save_ebay_state(state)
+
         await interaction.followup.send("Marked this conversation as finished.", ephemeral=True)
 
 
@@ -549,7 +576,7 @@ async def create_new_conversation_thread(
         thread = None
 
     try:
-        history = fetch_ebay_conversation_history(access_token, convo_id)
+        history = await asyncio.to_thread(fetch_ebay_conversation_history, access_token, convo_id)
     except (EbayRateLimitError, requests.RequestException) as e:
         print(f"Failed to fetch message history for customer conversation {convo_id}: {e}")
         history = []
@@ -767,6 +794,11 @@ async def process_customer_conversations(customer_channel, conversations, state,
 
 @tasks.loop(minutes=2)
 async def check_ebay_activity():
+    async with ebay_state_lock:
+        await _check_ebay_activity()
+
+
+async def _check_ebay_activity():
     global ebay_rate_limited
 
     if not EBAY_ACCOUNTS:
@@ -789,7 +821,7 @@ async def check_ebay_activity():
                 print(f"eBay customer channel {account['customer_channel_id']} not found for account {account_name}.")
 
         try:
-            access_token = get_access_token(account["refresh_token"])
+            access_token = await asyncio.to_thread(get_access_token, account["refresh_token"])
         except requests.RequestException as e:
             print(f"eBay token refresh failed for account {account_name}: {e}")
             continue
@@ -797,7 +829,7 @@ async def check_ebay_activity():
         account_state = state[account_name]
 
         try:
-            orders = fetch_ebay_orders(access_token)
+            orders = await asyncio.to_thread(fetch_ebay_orders, access_token)
         except EbayRateLimitError as e:
             print(f"eBay order check rate-limited for account {account_name}: {e}")
             await notify_ebay_rate_limit(channel)
@@ -829,7 +861,7 @@ async def check_ebay_activity():
             save_ebay_state(state)
 
         try:
-            conversations = fetch_ebay_conversations(access_token)
+            conversations = await asyncio.to_thread(fetch_ebay_conversations, access_token)
         except EbayRateLimitError as e:
             print(f"eBay conversation check rate-limited for account {account_name}: {e}")
             await notify_ebay_rate_limit(channel)
@@ -878,8 +910,13 @@ async def check_ebay_activity():
     ebay_rate_limited = False
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=EBAY_TRADING_POLL_MINUTES)
 async def check_ebay_trading_activity():
+    async with ebay_state_lock:
+        await _check_ebay_trading_activity()
+
+
+async def _check_ebay_trading_activity():
     # Classic Trading API fallback, ricky.garage-specific. Deliberately its
     # own background loop, isolated from check_ebay_activity() above - a
     # different credential (shared with Lister Tool), a different protocol,
@@ -904,13 +941,15 @@ async def check_ebay_trading_activity():
     state = load_ebay_state()
     trading_state = state[EBAY_TRADING_STATE_KEY]
     now = datetime.now(timezone.utc)
-    # 2-minute poll interval + a 5-minute overlap buffer, so a slow-to-settle
-    # order can't fall between two polls and get missed entirely. The
+    # Two poll intervals + a 5-minute buffer: covers a slow-to-settle order,
+    # and also one entirely failed poll (e.g. eBay error 518) without any
+    # order falling between windows and being missed for good. The
     # overlap's duplicates are filtered out by the seen_order_ids diff below.
-    window_start = now - timedelta(minutes=7)
+    window_start = now - timedelta(minutes=2 * EBAY_TRADING_POLL_MINUTES + 5)
 
     try:
-        orders = ebay_trading.fetch_trading_orders(
+        orders = await asyncio.to_thread(
+            ebay_trading.fetch_trading_orders,
             EBAY_TRADING_CLIENT_ID, EBAY_TRADING_CLIENT_SECRET, EBAY_TRADING_REFRESH_TOKEN,
             window_start, now,
         )
@@ -936,7 +975,8 @@ async def check_ebay_trading_activity():
         save_ebay_state(state)
 
     try:
-        messages = ebay_trading.fetch_trading_messages(
+        messages = await asyncio.to_thread(
+            ebay_trading.fetch_trading_messages,
             EBAY_TRADING_CLIENT_ID, EBAY_TRADING_CLIENT_SECRET, EBAY_TRADING_REFRESH_TOKEN,
         )
     except (ebay_trading.TradingApiError, requests.RequestException) as e:
