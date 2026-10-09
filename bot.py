@@ -87,6 +87,16 @@ EBAY_TRADING_ENABLED = bool(
 # channel env var, since this posts into the same channel as that account's
 # REST-based general feed - one channel ID to keep in sync, not two.
 EBAY_TRADING_STATE_KEY = f"{EBAY_TRADING_ACCOUNT_NAME}_trading" if EBAY_TRADING_ACCOUNT_NAME else None
+
+
+def is_trading_fallback_account(account):
+    """True for the account the Trading API fallback covers. The REST-based
+    check_ebay_activity skips it entirely: its REST token never worked
+    (invalid_grant, then invalid_scope - see claude.md), so polling it there
+    only produced a failed token refresh every cycle. The account entry
+    itself still has to exist - the Trading loop reuses its ALERT_CHANNEL_ID.
+    """
+    return EBAY_TRADING_ENABLED and account["name"] == EBAY_TRADING_ACCOUNT_NAME
 # How often the Trading API fallback polls. Defaults to 10 minutes (was a
 # hardcoded 2): every poll is 3+ Trading API calls on the app shared with
 # Lister Tool, and eBay was returning error 518 ("exceeded usage limit on
@@ -809,6 +819,11 @@ async def _check_ebay_activity():
     for account in EBAY_ACCOUNTS:
         account_name = account["name"]
 
+        if is_trading_fallback_account(account):
+            # Its REST token has never worked (see claude.md) - attempting it
+            # just logged a failed token refresh every poll, ~700/day.
+            continue
+
         channel = client.get_channel(account["alert_channel_id"])
         if channel is None:
             print(f"eBay alert channel {account['alert_channel_id']} not found for account {account_name}.")
@@ -1030,7 +1045,9 @@ async def on_ready():
     elif not EBAY_ACCOUNTS:
         print("eBay notifier not started: no active EBAY_ACCOUNT_*_NAME configured.")
     for account in EBAY_ACCOUNTS:
-        if not account["customer_channel_id"]:
+        if is_trading_fallback_account(account):
+            print(f"eBay account {account['name']}: REST polling skipped, covered by the Trading API fallback instead.")
+        elif not account["customer_channel_id"]:
             print(f"eBay customer-message channel not configured for account {account['name']} (general activity feed only).")
         elif not account["seller_username"]:
             print(
