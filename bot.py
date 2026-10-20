@@ -109,6 +109,12 @@ EBAY_CONVERSATION_URL = "https://api.ebay.com/commerce/message/v1/conversation"
 EBAY_STATE_FILE = "ebay_state.json"
 EBAY_RATE_LIMIT_MESSAGE = "⚠️ eBay API rate limit reached — skipping this check, will retry next cycle"
 EBAY_CUSTOMER_REMINDER_DELAY = timedelta(hours=24)
+# How often the REST-based check_ebay_activity polls (orders, messages,
+# customer threads). Defaults to 10 minutes (was a hardcoded 2) to cut eBay
+# call volume ~5x. Safe for orders (each poll diffs the latest 50 by ID, no
+# time window) and for customer threads (a burst of several buyer messages
+# between polls is caught up via messages_since_last_posted()).
+EBAY_POLL_MINUTES = max(1, int(os.environ.get("EBAY_POLL_MINUTES") or "10"))
 # (connect, read) seconds - requests has no default timeout.
 EBAY_HTTP_TIMEOUT = (10, 30)
 
@@ -359,6 +365,59 @@ def fetch_ebay_conversations(access_token):
     return response.json().get("conversations", [])
 
 
+def fetch_recent_conversation_messages(access_token, convo_id, limit=25):
+    """The newest `limit` messages of one conversation, oldest-first.
+
+    A single API call (unlike fetch_ebay_conversation_history, which pages
+    through everything) - enough to catch a burst of messages that arrived
+    between two polls. Same newest-first ordering as getConversation's
+    pagination (see fetch_ebay_conversation_history), reversed here.
+    """
+    response = requests.get(
+        f"{EBAY_CONVERSATION_URL}/{convo_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=EBAY_HTTP_TIMEOUT,
+        params={"conversation_type": "FROM_MEMBERS", "offset": 0, "limit": limit},
+    )
+    if is_ebay_rate_limit_response(response):
+        raise EbayRateLimitError("eBay conversation history API rate limit reached")
+    response.raise_for_status()
+    messages = response.json().get("messages", [])
+    messages.reverse()
+    return messages
+
+
+async def messages_since_last_posted(access_token, convo_id, known_ids, latest_id, latest_sender, latest_body):
+    """Every message after the newest one in known_ids, up to and including
+    latest_id, oldest-first - so a burst of buyer messages between polls all
+    reach the thread, not just the newest (the conversation list only ever
+    exposes latestMessage). Includes any seller replies in that span, as the
+    initial backfill does, for context.
+
+    Falls back to just the latest message - the old behavior - if the history
+    call fails, or if neither latest_id nor any known message is in the recent
+    window. It never dumps older history into a thread on a guess.
+    """
+    fallback = [{"messageId": latest_id, "senderUsername": latest_sender, "messageBody": latest_body}]
+    known_ids = {mid for mid in known_ids if mid}
+    if not latest_id or not known_ids:
+        return fallback
+    try:
+        recent = await asyncio.to_thread(fetch_recent_conversation_messages, access_token, convo_id)
+    except (EbayRateLimitError, requests.RequestException) as e:
+        print(f"Couldn't fetch recent history for customer conversation {convo_id}, posting latest message only: {e}")
+        return fallback
+
+    ids = [m.get("messageId") for m in recent]
+    if latest_id not in ids:
+        return fallback
+    end = ids.index(latest_id)
+    known_positions = [i for i, mid in enumerate(ids[:end]) if mid in known_ids]
+    if not known_positions:
+        return fallback
+    return recent[known_positions[-1] + 1:end + 1]
+
+
 def fetch_ebay_conversation_history(access_token, convo_id):
     """Full message history for one conversation, oldest-first.
 
@@ -402,9 +461,14 @@ async def notify_ebay_rate_limit(channel):
         pass
 
 
+TRUNCATION_SUFFIX = "… (truncated)"
+
+
 def truncate_for_discord(text, limit=1800):
-    if len(text) > limit:
-        return text[:limit].rstrip() + "… (truncated)"
+    # Idempotent: some paths truncate a body and later pass it through here
+    # again (e.g. messages_since_last_posted's latest-only fallback).
+    if len(text) > limit and not (text.endswith(TRUNCATION_SUFFIX) and len(text) <= limit + len(TRUNCATION_SUFFIX)):
+        return text[:limit].rstrip() + TRUNCATION_SUFFIX
     return text
 
 
@@ -635,32 +699,51 @@ async def create_new_conversation_thread(
     return True
 
 
-async def post_new_thread_message(customer_channel, state, full_state, convo_id, entry, sender, message_body, message_id, now):
+async def post_new_thread_message(
+    customer_channel, state, full_state, access_token, convo_id, entry, sender, message_body, message_id, now,
+):
     thread = await get_or_create_conversation_thread(customer_channel, state, full_state, convo_id, entry)
     destination = thread if thread is not None else customer_channel
 
-    try:
-        await destination.send(format_thread_message(sender, message_body))
-    except discord.HTTPException as e:
-        print(f"Failed to post new message for customer conversation {convo_id}: {e}")
-        return False
-
-    # New message restarts the 24h reminder clock.
-    entry["first_seen_utc"] = now.isoformat()
-    entry["reminded"] = False
-    entry["last_ebay_message_id"] = message_id
     # Deliberately indexes rather than setdefault()s: the caller is expected to
     # have already seeded this for legacy entries, so a missing key here should
     # fail loudly instead of silently masking a re-introduced backfill gap.
     posted_ids = entry["posted_message_ids"]
-    if message_id not in posted_ids:
-        posted_ids.append(message_id)
-    state["customer_last_notified_message_ids"][convo_id] = message_id
+    new_messages = await messages_since_last_posted(
+        access_token, convo_id, posted_ids, message_id, sender, message_body
+    )
+
+    last_posted_id = None
+    for msg in new_messages:
+        msg_id = msg.get("messageId")
+        try:
+            await destination.send(format_thread_message(
+                msg.get("senderUsername", "unknown"), truncate_for_discord(msg.get("messageBody", ""))
+            ))
+        except discord.HTTPException as e:
+            print(f"Failed to post new message for customer conversation {convo_id}: {e}")
+            break
+        if msg_id and msg_id not in posted_ids:
+            posted_ids.append(msg_id)
+        last_posted_id = msg_id
+
+    if last_posted_id is None:
+        return False
+
+    # New message restarts the 24h reminder clock. If a send failed partway,
+    # message_id isn't in posted_ids yet, so the next poll picks up the rest
+    # from last_posted_id onward.
+    entry["first_seen_utc"] = now.isoformat()
+    entry["reminded"] = False
+    entry["last_ebay_message_id"] = last_posted_id
+    state["customer_last_notified_message_ids"][convo_id] = last_posted_id
     save_ebay_state(full_state)
     return True
 
 
-async def reopen_conversation_thread(customer_channel, state, full_state, convo_id, thread_id, buyer, message_body, message_id, now):
+async def reopen_conversation_thread(
+    customer_channel, state, full_state, access_token, convo_id, thread_id, buyer, message_body, message_id, now,
+):
     # Conversation went quiet (seller replied, or "Mark as Finished") and its
     # customer_conversations entry was cleared, but the buyer just wrote again.
     # Reuse the existing thread instead of creating a new one and re-backfilling
@@ -680,22 +763,42 @@ async def reopen_conversation_thread(customer_channel, state, full_state, convo_
             print(f"Transient error resolving thread for customer conversation {convo_id}, will retry next poll: {e}")
             return None
 
-    try:
-        await thread.send(format_thread_message(buyer, message_body))
-    except discord.HTTPException as e:
-        print(f"Failed to post reopened message for customer conversation {convo_id}: {e}")
+    # Everything since the last message this thread was told about - i.e. the
+    # seller's reply that resolved it (if any) plus every new buyer message.
+    new_messages = await messages_since_last_posted(
+        access_token, convo_id, [state["customer_last_notified_message_ids"].get(convo_id)],
+        message_id, buyer, message_body,
+    )
+
+    posted_ids = []
+    for msg in new_messages:
+        try:
+            await thread.send(format_thread_message(
+                msg.get("senderUsername", "unknown"), truncate_for_discord(msg.get("messageBody", ""))
+            ))
+        except discord.HTTPException as e:
+            print(f"Failed to post reopened message for customer conversation {convo_id}: {e}")
+            break
+        if msg.get("messageId"):
+            posted_ids.append(msg["messageId"])
+
+    if not posted_ids:
+        # Nothing reached the thread - treat as broken, same as before.
         return False
 
+    # If a send failed partway, message_id isn't in posted_ids, so the next
+    # poll's tracked-conversation path posts the rest into this same thread.
+    last_posted_id = posted_ids[-1]
     state["customer_conversations"][convo_id] = {
         "first_seen_utc": now.isoformat(),
         "reminded": False,
         "buyer_username": buyer,
         "message_id": thread.id,  # thread shares its id with the message that started it
         "thread_id": thread.id,
-        "last_ebay_message_id": message_id,
-        "posted_message_ids": [message_id] if message_id else [],
+        "last_ebay_message_id": last_posted_id,
+        "posted_message_ids": posted_ids,
     }
-    state["customer_last_notified_message_ids"][convo_id] = message_id
+    state["customer_last_notified_message_ids"][convo_id] = last_posted_id
     save_ebay_state(full_state)
     return True
 
@@ -741,7 +844,8 @@ async def process_customer_conversations(customer_channel, conversations, state,
                 # Same buyer, but a new message arrived on this still-open conversation -
                 # post it into the existing thread and restart the 24h reminder clock.
                 await post_new_thread_message(
-                    customer_channel, state, full_state, convo_id, entry, sender, message_body, message_id, now
+                    customer_channel, state, full_state, access_token, convo_id, entry, sender, message_body,
+                    message_id, now,
                 )
                 continue
 
@@ -788,7 +892,8 @@ async def process_customer_conversations(customer_channel, conversations, state,
             reopened = False
             if existing_thread_id:
                 reopened = await reopen_conversation_thread(
-                    customer_channel, state, full_state, convo_id, existing_thread_id, buyer, message_body, message_id, now
+                    customer_channel, state, full_state, access_token, convo_id, existing_thread_id, buyer,
+                    message_body, message_id, now,
                 )
             if reopened is False:
                 # No known thread for this conversation, or it's genuinely
@@ -802,7 +907,7 @@ async def process_customer_conversations(customer_channel, conversations, state,
                 )
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=EBAY_POLL_MINUTES)
 async def check_ebay_activity():
     async with ebay_state_lock:
         await _check_ebay_activity()
