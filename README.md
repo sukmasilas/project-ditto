@@ -81,19 +81,18 @@ Each account is a numbered block of env vars, starting at `EBAY_ACCOUNT_1_*`:
 - `EBAY_ACCOUNT_1_NAME` — a short label for this account (used internally, e.g. `ricky.game`)
 - `EBAY_ACCOUNT_1_REFRESH_TOKEN` — this account's eBay OAuth refresh token (from `get_ebay_token.py`,
   run once while logged into *that* eBay seller account — each account needs its own, they can't share)
-- `EBAY_ACCOUNT_1_SELLER_USERNAME` — this account's eBay username
-- `EBAY_ACCOUNT_1_ALERT_CHANNEL_ID` — the Discord channel ID for this account's order/notice feed
-- `EBAY_ACCOUNT_1_CUSTOMER_CHANNEL_ID` — optional, see below
+- `EBAY_ACCOUNT_1_SELLER_USERNAME` — this account's eBay username (needed for the 24h reminders)
+- `EBAY_ACCOUNT_1_ALERT_CHANNEL_ID` — the Discord channel ID for this account's orders, messages,
+  eBay notices and 24h "still unreplied" reminders
 
 Add `EBAY_ACCOUNT_2_*`, `EBAY_ACCOUNT_3_*`, etc. the same way for additional accounts, starting
 at 1 with no gaps in the numbering. An account is only active once it has `NAME`,
 `REFRESH_TOKEN`, and `ALERT_CHANNEL_ID` all set — one with just `NAME` filled in (e.g. while
 you're still waiting on its refresh token) is skipped at startup rather than erroring.
 
-**Customer-message threading is single-account only right now.** Only set
-`EBAY_ACCOUNT_N_CUSTOMER_CHANNEL_ID` on the *one* account whose buyer messages should get the
-full treatment (root notification, thread, 24h escalation, @everyone pings) — leave it blank
-on every other account.
+A newly added account's first check quietly records its existing orders and messages, so it
+doesn't announce old ones as new. (`EBAY_ACCOUNT_N_CUSTOMER_CHANNEL_ID` and the
+#customer-service threads were removed 2026-11-04 — the setting is ignored if still present.)
 
 `EBAY_APP_ID` / `EBAY_CERT_ID` / `EBAY_RUNAME` stay as single, shared values — they identify
 the eBay *application* these accounts authorize through, not a specific seller account.
