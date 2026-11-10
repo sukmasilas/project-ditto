@@ -5,6 +5,10 @@ import requests
 
 from ebay_auth import APP_ID, AUTH_URL, RUNAME, SCOPE, exchange_code_for_tokens
 
+# Consent asks for SCOPE plus sell.marketing (Uxie's Promoted Listings, user 2026-10-26). Only the consent URL: token
+# refreshes keep sending SCOPE alone, which stays valid because it is a subset of what the new token carries.
+CONSENT_SCOPE = SCOPE + " https://api.ebay.com/oauth/api_scope/sell.marketing"
+
 
 def print_consent_url():
     url = (
@@ -12,7 +16,7 @@ def print_consent_url():
         f"?client_id={quote(APP_ID)}"
         f"&redirect_uri={quote(RUNAME)}"
         f"&response_type=code"
-        f"&scope={quote(SCOPE)}"
+        f"&scope={quote(CONSENT_SCOPE)}"
     )
     print("Open this URL in a browser and sign in to authorize the app:\n")
     print(url)
